@@ -17,6 +17,18 @@ class Room(models.Model):
         return self.name
 
 
+class ReadState(models.Model):
+    """Tracks the last time a user read a given room — used to compute
+    unread message counts (messages in the room newer than last_read_at,
+    excluding the user's own)."""
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    room = models.ForeignKey(Room, on_delete=models.CASCADE)
+    last_read_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("user", "room")
+
+
 class Message(models.Model):
     room = models.ForeignKey(Room, related_name="messages", on_delete=models.CASCADE)
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)

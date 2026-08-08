@@ -3,6 +3,8 @@ import json
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
 
+from chat import presence
+
 
 class ChatConsumer(AsyncWebsocketConsumer):
     """
@@ -43,6 +45,16 @@ class ChatConsumer(AsyncWebsocketConsumer):
             },
         )
 
+        # Presence: only the user's *first* active connection (across tabs/
+        # devices) counts as "coming online" — see chat/presence.py.
+        just_came_online = await presence.mark_connected(self.user.id)
+        if just_came_online:
+            await self.set_online_state(self.user, True)
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {"type": "presence_update", "username": self.user.username, "is_online": True},
+            )
+
     async def disconnect(self, close_code):
         if hasattr(self, "room_group_name"):
             await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
@@ -55,8 +67,31 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     },
                 )
 
+                just_went_offline = await presence.mark_disconnected(self.user.id)
+                if just_went_offline:
+                    await self.set_online_state(self.user, False)
+                    await self.channel_layer.group_send(
+                        self.room_group_name,
+                        {"type": "presence_update", "username": self.user.username, "is_online": False},
+                    )
+
     async def receive(self, text_data):
         data = json.loads(text_data)
+
+        # Typing indicator: ephemeral, never persisted. Distinguished from a
+        # chat message by an explicit "type" field in the client payload.
+        if data.get("type") == "typing":
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    "type": "typing_update",
+                    "username": self.user.username,
+                    "is_typing": bool(data.get("is_typing")),
+                    "sender_channel": self.channel_name,
+                },
+            )
+            return
+
         content = data.get("content", "").strip()
         if not content:
             return
@@ -99,6 +134,24 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "username": event["username"],
         }))
 
+    async def presence_update(self, event):
+        await self.send(text_data=json.dumps({
+            "event": "presence",
+            "username": event["username"],
+            "is_online": event["is_online"],
+        }))
+
+    async def typing_update(self, event):
+        # Don't echo typing events back to the person who's typing —
+        # they already know they're typing.
+        if event.get("sender_channel") == self.channel_name:
+            return
+        await self.send(text_data=json.dumps({
+            "event": "typing",
+            "username": event["username"],
+            "is_typing": event["is_typing"],
+        }))
+
     # --- DB helpers ---
     # Consumer methods are async, but the ORM isn't, so DB calls are
     # wrapped with database_sync_to_async.
@@ -121,3 +174,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
         from chat.models import Room, Message
         room = Room.objects.get(name=room_name)
         return Message.objects.create(room=room, user=user, content=content)
+
+    @database_sync_to_async
+    def set_online_state(self, user, is_online):
+        user.is_online = is_online
+        user.save(update_fields=["is_online"])
