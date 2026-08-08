@@ -1,181 +1,111 @@
-import json
+from django.contrib.auth import get_user_model
+from django.db.models import Q
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from rest_framework import generics, permissions, status
+from rest_framework.pagination import CursorPagination
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
-from channels.db import database_sync_to_async
-from channels.generic.websocket import AsyncWebsocketConsumer
+from .models import Room, Message, ReadState
+from .serializers import RoomSerializer, MessageSerializer, UserSerializer
 
-from chat import presence
+User = get_user_model()
 
 
-class ChatConsumer(AsyncWebsocketConsumer):
+class RoomListView(generics.ListAPIView):
+    """Public/group rooms only — DMs are surfaced separately via /api/dms/."""
+    queryset = Room.objects.filter(is_private=False)
+    serializer_class = RoomSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+
+class UserListView(generics.ListAPIView):
+    """GET /api/users/ — other users you can start a DM with."""
+    serializer_class = UserSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return User.objects.exclude(id=self.request.user.id).order_by("username")
+
+
+class DMListView(generics.ListAPIView):
+    """GET /api/dms/ — your existing 1:1 conversations."""
+    serializer_class = RoomSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Room.objects.filter(is_private=True, participants=self.request.user)
+
+
+class StartDMView(APIView):
     """
-    One consumer instance per connected client. `room_group_name` maps to
-    a Channels "group" — Channels' equivalent of a Socket.IO room — which
-    is how we broadcast a message from one client to everyone else in the
-    same room (and, in Phase 5, across server processes via the Redis
-    channel layer).
+    POST /api/dms/ {"username": "bob"} — finds the existing DM room between
+    the current user and the named user, or creates one. Room names for DMs
+    are derived deterministically from both user IDs (sorted, so it's the
+    same regardless of who starts the conversation) rather than exposed as
+    something guessable from usernames alone.
     """
+    permission_classes = [permissions.IsAuthenticated]
 
-    async def connect(self):
-        self.room_name = self.scope["url_route"]["kwargs"]["room_name"]
-        self.room_group_name = f"chat_{self.room_name}"
-        self.user = self.scope["user"]
+    def post(self, request):
+        username = request.data.get("username")
+        if not username:
+            return Response({"detail": "username is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not self.user or not self.user.is_authenticated:
-            await self.close(code=4001)  # unauthorized
-            return
+        other_user = get_object_or_404(User, username=username)
+        if other_user.id == request.user.id:
+            return Response({"detail": "Can't start a DM with yourself"}, status=status.HTTP_400_BAD_REQUEST)
 
-        room_exists = await self.room_exists(self.room_name)
-        if not room_exists:
-            await self.close(code=4004)  # room not found
-            return
+        ids = sorted([request.user.id, other_user.id])
+        room_name = f"dm-{ids[0]}-{ids[1]}"
 
-        is_authorized = await self.user_can_access_room(self.room_name, self.user)
-        if not is_authorized:
-            await self.close(code=4003)  # forbidden — not a participant in this private room
-            return
+        room, created = Room.objects.get_or_create(
+            name=room_name,
+            defaults={"is_private": True},
+        )
+        if created:
+            room.participants.set([request.user, other_user])
 
-        await self.channel_layer.group_add(self.room_group_name, self.channel_name)
-        await self.accept()
-
-        await self.channel_layer.group_send(
-            self.room_group_name,
-            {
-                "type": "user_joined",
-                "username": self.user.username,
-            },
+        return Response(
+            RoomSerializer(room, context={"request": request}).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
 
-        # Presence: only the user's *first* active connection (across tabs/
-        # devices) counts as "coming online" — see chat/presence.py.
-        just_came_online = await presence.mark_connected(self.user.id)
-        if just_came_online:
-            await self.set_online_state(self.user, True)
-            await self.channel_layer.group_send(
-                self.room_group_name,
-                {"type": "presence_update", "username": self.user.username, "is_online": True},
-            )
 
-    async def disconnect(self, close_code):
-        if hasattr(self, "room_group_name"):
-            await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
-            if self.user and self.user.is_authenticated:
-                await self.channel_layer.group_send(
-                    self.room_group_name,
-                    {
-                        "type": "user_left",
-                        "username": self.user.username,
-                    },
-                )
+class MessagePagination(CursorPagination):
+    # Cursor pagination (vs. offset/limit) so results stay stable even as
+    # new messages are added while someone scrolls up through history —
+    # doing this now avoids the Phase 4 rework flagged earlier.
+    page_size = 30
+    ordering = "-created_at"
 
-                just_went_offline = await presence.mark_disconnected(self.user.id)
-                if just_went_offline:
-                    await self.set_online_state(self.user, False)
-                    await self.channel_layer.group_send(
-                        self.room_group_name,
-                        {"type": "presence_update", "username": self.user.username, "is_online": False},
-                    )
 
-    async def receive(self, text_data):
-        data = json.loads(text_data)
+class RoomMessageListView(generics.ListAPIView):
+    """GET /api/rooms/<room_id>/messages/ — history to load when a user joins a room."""
+    serializer_class = MessageSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    pagination_class = MessagePagination
 
-        # Typing indicator: ephemeral, never persisted. Distinguished from a
-        # chat message by an explicit "type" field in the client payload.
-        if data.get("type") == "typing":
-            await self.channel_layer.group_send(
-                self.room_group_name,
-                {
-                    "type": "typing_update",
-                    "username": self.user.username,
-                    "is_typing": bool(data.get("is_typing")),
-                    "sender_channel": self.channel_name,
-                },
-            )
-            return
+    def get_queryset(self):
+        room_id = self.kwargs["room_id"]
+        room = get_object_or_404(Room, id=room_id)
 
-        content = data.get("content", "").strip()
-        if not content:
-            return
+        # Private rooms: only participants may read history. Public rooms:
+        # anyone authenticated can (matches the open-room model from Phase 1).
+        if room.is_private and not room.participants.filter(id=self.request.user.id).exists():
+            return Message.objects.none()
 
-        message = await self.save_message(self.room_name, self.user, content)
+        return Message.objects.filter(room_id=room_id).order_by("-created_at")
 
-        await self.channel_layer.group_send(
-            self.room_group_name,
-            {
-                "type": "chat_message",
-                "id": message.id,
-                "username": self.user.username,
-                "content": message.content,
-                "created_at": message.created_at.isoformat(),
-            },
-        )
 
-    # --- group event handlers ---
-    # Each of these corresponds to a "type" sent via group_send above,
-    # and pushes that event down to this consumer's own client socket.
+class MarkRoomReadView(APIView):
+    """POST /api/rooms/<room_id>/read/ — updates (or creates) the current
+    user's read marker for this room to now, clearing its unread count."""
+    permission_classes = [permissions.IsAuthenticated]
 
-    async def chat_message(self, event):
-        await self.send(text_data=json.dumps({
-            "event": "message",
-            "id": event["id"],
-            "username": event["username"],
-            "content": event["content"],
-            "created_at": event["created_at"],
-        }))
-
-    async def user_joined(self, event):
-        await self.send(text_data=json.dumps({
-            "event": "user_joined",
-            "username": event["username"],
-        }))
-
-    async def user_left(self, event):
-        await self.send(text_data=json.dumps({
-            "event": "user_left",
-            "username": event["username"],
-        }))
-
-    async def presence_update(self, event):
-        await self.send(text_data=json.dumps({
-            "event": "presence",
-            "username": event["username"],
-            "is_online": event["is_online"],
-        }))
-
-    async def typing_update(self, event):
-        # Don't echo typing events back to the person who's typing —
-        # they already know they're typing.
-        if event.get("sender_channel") == self.channel_name:
-            return
-        await self.send(text_data=json.dumps({
-            "event": "typing",
-            "username": event["username"],
-            "is_typing": event["is_typing"],
-        }))
-
-    # --- DB helpers ---
-    # Consumer methods are async, but the ORM isn't, so DB calls are
-    # wrapped with database_sync_to_async.
-
-    @database_sync_to_async
-    def room_exists(self, room_name):
-        from chat.models import Room
-        return Room.objects.filter(name=room_name).exists()
-
-    @database_sync_to_async
-    def user_can_access_room(self, room_name, user):
-        from chat.models import Room
-        room = Room.objects.get(name=room_name)
-        if not room.is_private:
-            return True
-        return room.participants.filter(id=user.id).exists()
-
-    @database_sync_to_async
-    def save_message(self, room_name, user, content):
-        from chat.models import Room, Message
-        room = Room.objects.get(name=room_name)
-        return Message.objects.create(room=room, user=user, content=content)
-
-    @database_sync_to_async
-    def set_online_state(self, user, is_online):
-        user.is_online = is_online
-        user.save(update_fields=["is_online"])
+    def post(self, request, room_id):
+        room = get_object_or_404(Room, id=room_id)
+        read_state, _ = ReadState.objects.get_or_create(user=request.user, room=room)
+        read_state.save()  # last_read_at has auto_now=True, so saving bumps it
+        return Response({"last_read_at": read_state.last_read_at})

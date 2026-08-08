@@ -110,8 +110,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
         )
 
     # --- group event handlers ---
-    # Each of these corresponds to a "type" sent via group_send above,
-    # and pushes that event down to this consumer's own client socket.
 
     async def chat_message(self, event):
         await self.send(text_data=json.dumps({
@@ -142,8 +140,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
         }))
 
     async def typing_update(self, event):
-        # Don't echo typing events back to the person who's typing —
-        # they already know they're typing.
         if event.get("sender_channel") == self.channel_name:
             return
         await self.send(text_data=json.dumps({
@@ -153,8 +149,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
         }))
 
     # --- DB helpers ---
-    # Consumer methods are async, but the ORM isn't, so DB calls are
-    # wrapped with database_sync_to_async.
 
     @database_sync_to_async
     def room_exists(self, room_name):

@@ -13,9 +13,6 @@ class UserSerializer(serializers.ModelSerializer):
 
 
 class RoomSerializer(serializers.ModelSerializer):
-    # For private (DM) rooms, surface the *other* participant so the
-    # frontend can show "Bob" instead of the internal room name like
-    # "dm-1-2" — the room name stays an implementation detail.
     other_participant = serializers.SerializerMethodField()
     unread_count = serializers.SerializerMethodField()
 
