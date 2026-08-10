@@ -8,7 +8,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import Room, Message, ReadState
-from .serializers import RoomSerializer, MessageSerializer, UserSerializer
+from .serializers import RoomSerializer, MessageSerializer, UserSerializer, ProfileSerializer
 
 User = get_user_model()
 
@@ -21,12 +21,26 @@ class RoomListView(generics.ListAPIView):
 
 
 class UserListView(generics.ListAPIView):
-    """GET /api/users/ — other users you can start a DM with."""
+    """GET /api/users/ — other users you can start a DM with.
+    Supports ?search=<query> for username filtering (used by the
+    "new message" picker's search box)."""
     serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return User.objects.exclude(id=self.request.user.id).order_by("username")
+        qs = User.objects.exclude(id=self.request.user.id)
+        search = self.request.query_params.get("search")
+        if search:
+            qs = qs.filter(username__icontains=search)
+        return qs.order_by("username")
+
+
+class UserProfileView(generics.RetrieveAPIView):
+    """GET /api/users/<id>/profile/ — another user's public profile."""
+    queryset = User.objects.all()
+    serializer_class = ProfileSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    lookup_url_kwarg = "user_id"
 
 
 class DMListView(generics.ListAPIView):

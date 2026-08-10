@@ -17,3 +17,13 @@ class RegisterSerializer(serializers.ModelSerializer):
         user.set_password(validated_data["password"])
         user.save()
         return user
+
+
+class ProfileSerializer(serializers.ModelSerializer):
+    """Fuller user representation for profile pages — includes date_joined,
+    which the chat app's compact UserSerializer omits since it's not
+    needed in lists/pickers."""
+
+    class Meta:
+        model = User
+        fields = ["id", "username", "is_online", "date_joined"]

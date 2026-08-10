@@ -92,6 +92,23 @@ class ChatConsumer(AsyncWebsocketConsumer):
             )
             return
 
+        # Read receipt: fired when the client has the room open/visible.
+        # Updates ReadState (same table the unread-count REST endpoint
+        # uses) and broadcasts live so the other participant's "Seen" the
+        # updates without needing to poll or reopen the room.
+        if data.get("type") == "read":
+            last_read_at = await self.mark_read(self.room_name, self.user)
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    "type": "read_update",
+                    "username": self.user.username,
+                    "last_read_at": last_read_at.isoformat(),
+                    "sender_channel": self.channel_name,
+                },
+            )
+            return
+
         content = data.get("content", "").strip()
         if not content:
             return
@@ -110,6 +127,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
         )
 
     # --- group event handlers ---
+    # Each of these corresponds to a "type" sent via group_send above,
+    # and pushes that event down to this consumer's own client socket.
 
     async def chat_message(self, event):
         await self.send(text_data=json.dumps({
@@ -140,6 +159,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
         }))
 
     async def typing_update(self, event):
+        # Don't echo typing events back to the person who's typing —
+        # they already know they're typing.
         if event.get("sender_channel") == self.channel_name:
             return
         await self.send(text_data=json.dumps({
@@ -148,7 +169,19 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "is_typing": event["is_typing"],
         }))
 
+    async def read_update(self, event):
+        # Don't echo your own read receipt back to yourself.
+        if event.get("sender_channel") == self.channel_name:
+            return
+        await self.send(text_data=json.dumps({
+            "event": "read",
+            "username": event["username"],
+            "last_read_at": event["last_read_at"],
+        }))
+
     # --- DB helpers ---
+    # Consumer methods are async, but the ORM isn't, so DB calls are
+    # wrapped with database_sync_to_async.
 
     @database_sync_to_async
     def room_exists(self, room_name):
@@ -173,3 +206,11 @@ class ChatConsumer(AsyncWebsocketConsumer):
     def set_online_state(self, user, is_online):
         user.is_online = is_online
         user.save(update_fields=["is_online"])
+
+    @database_sync_to_async
+    def mark_read(self, room_name, user):
+        from chat.models import Room, ReadState
+        room = Room.objects.get(name=room_name)
+        read_state, _ = ReadState.objects.get_or_create(user=user, room=room)
+        read_state.save()  # last_read_at has auto_now=True, so saving bumps it
+        return read_state.last_read_at

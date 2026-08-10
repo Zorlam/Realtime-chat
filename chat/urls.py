@@ -4,6 +4,7 @@ from .views import (
     RoomListView,
     RoomMessageListView,
     UserListView,
+    UserProfileView,
     DMListView,
     StartDMView,
     MarkRoomReadView,
@@ -14,6 +15,7 @@ urlpatterns = [
     path("rooms/<int:room_id>/messages/", RoomMessageListView.as_view(), name="room-messages"),
     path("rooms/<int:room_id>/read/", MarkRoomReadView.as_view(), name="room-read"),
     path("users/", UserListView.as_view(), name="user-list"),
+    path("users/<int:user_id>/profile/", UserProfileView.as_view(), name="user-profile"),
     path("dms/", DMListView.as_view(), name="dm-list"),          # GET
     path("dms/start/", StartDMView.as_view(), name="dm-start"),  # POST
 ]

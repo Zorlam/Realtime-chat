@@ -2,7 +2,7 @@ from rest_framework import generics, permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .serializers import RegisterSerializer
+from .serializers import RegisterSerializer, ProfileSerializer
 
 
 class RegisterView(generics.CreateAPIView):
@@ -11,11 +11,8 @@ class RegisterView(generics.CreateAPIView):
 
 
 class MeView(APIView):
-    """Quick sanity-check endpoint: confirms a JWT is valid and returns the user it belongs to."""
+    """Returns the logged-in user's own profile."""
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        return Response({
-            "id": request.user.id,
-            "username": request.user.username,
-        })
+        return Response(ProfileSerializer(request.user).data)
