@@ -13,6 +13,11 @@ class ChatConsumer(AsyncWebsocketConsumer):
     is how we broadcast a message from one client to everyone else in the
     same room (and, in Phase 5, across server processes via the Redis
     channel layer).
+
+    This consumer only reaches clients who currently have this specific
+    room open. See NotificationConsumer below for the separate, always-on
+    per-user channel that lets a person's sidebar/unread badges update
+    even for conversations they don't have open right now.
     """
 
     async def connect(self):
@@ -45,8 +50,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
             },
         )
 
-        # Presence: only the user's *first* active connection (across tabs/
-        # devices) counts as "coming online" — see chat/presence.py.
         just_came_online = await presence.mark_connected(self.user.id)
         if just_came_online:
             await self.set_online_state(self.user, True)
@@ -78,8 +81,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
     async def receive(self, text_data):
         data = json.loads(text_data)
 
-        # Typing indicator: ephemeral, never persisted. Distinguished from a
-        # chat message by an explicit "type" field in the client payload.
         if data.get("type") == "typing":
             await self.channel_layer.group_send(
                 self.room_group_name,
@@ -92,10 +93,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
             )
             return
 
-        # Read receipt: fired when the client has the room open/visible.
-        # Updates ReadState (same table the unread-count REST endpoint
-        # uses) and broadcasts live so the other participant's "Seen" the
-        # updates without needing to poll or reopen the room.
         if data.get("type") == "read":
             last_read_at = await self.mark_read(self.room_name, self.user)
             await self.channel_layer.group_send(
@@ -109,11 +106,21 @@ class ChatConsumer(AsyncWebsocketConsumer):
             )
             return
 
+        if data.get("type") == "delete_message":
+            message_id = data.get("message_id")
+            deleted = await self.delete_message(message_id, self.user)
+            if deleted:
+                await self.channel_layer.group_send(
+                    self.room_group_name,
+                    {"type": "message_deleted_update", "id": message_id},
+                )
+            return
+
         content = data.get("content", "").strip()
         if not content:
             return
 
-        message = await self.save_message(self.room_name, self.user, content)
+        message, other_participant_ids = await self.save_message(self.room_name, self.user, content)
 
         await self.channel_layer.group_send(
             self.room_group_name,
@@ -126,9 +133,17 @@ class ChatConsumer(AsyncWebsocketConsumer):
             },
         )
 
+        # Notify the other participant(s) even if they don't have this
+        # room open right now — this is what makes a brand-new DM (or any
+        # message in a conversation you haven't opened) actually show up
+        # without needing a page refresh.
+        for user_id in other_participant_ids:
+            await self.channel_layer.group_send(
+                f"notify_user_{user_id}",
+                {"type": "conversation_update"},
+            )
+
     # --- group event handlers ---
-    # Each of these corresponds to a "type" sent via group_send above,
-    # and pushes that event down to this consumer's own client socket.
 
     async def chat_message(self, event):
         await self.send(text_data=json.dumps({
@@ -137,6 +152,13 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "username": event["username"],
             "content": event["content"],
             "created_at": event["created_at"],
+            "deleted": False,
+        }))
+
+    async def message_deleted_update(self, event):
+        await self.send(text_data=json.dumps({
+            "event": "message_deleted",
+            "id": event["id"],
         }))
 
     async def user_joined(self, event):
@@ -159,8 +181,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
         }))
 
     async def typing_update(self, event):
-        # Don't echo typing events back to the person who's typing —
-        # they already know they're typing.
         if event.get("sender_channel") == self.channel_name:
             return
         await self.send(text_data=json.dumps({
@@ -170,7 +190,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
         }))
 
     async def read_update(self, event):
-        # Don't echo your own read receipt back to yourself.
         if event.get("sender_channel") == self.channel_name:
             return
         await self.send(text_data=json.dumps({
@@ -180,8 +199,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
         }))
 
     # --- DB helpers ---
-    # Consumer methods are async, but the ORM isn't, so DB calls are
-    # wrapped with database_sync_to_async.
 
     @database_sync_to_async
     def room_exists(self, room_name):
@@ -200,7 +217,34 @@ class ChatConsumer(AsyncWebsocketConsumer):
     def save_message(self, room_name, user, content):
         from chat.models import Room, Message
         room = Room.objects.get(name=room_name)
-        return Message.objects.create(room=room, user=user, content=content)
+        message = Message.objects.create(room=room, user=user, content=content)
+
+        # A reply from the recipient of a pending message request counts
+        # as accepting it — no separate "accept" click needed once they've
+        # engaged with the conversation.
+        if room.is_private and not room.accepted and room.initiated_by_id != user.id:
+            room.accepted = True
+            room.save(update_fields=["accepted"])
+
+        other_ids = []
+        if room.is_private:
+            other_ids = list(room.participants.exclude(id=user.id).values_list("id", flat=True))
+
+        return message, other_ids
+
+    @database_sync_to_async
+    def delete_message(self, message_id, user):
+        from chat.models import Message
+        try:
+            message = Message.objects.get(id=message_id)
+        except Message.DoesNotExist:
+            return False
+        if message.user_id != user.id:
+            return False  # only the sender can delete their own message
+        message.is_deleted = True
+        message.content = ""
+        message.save(update_fields=["is_deleted", "content"])
+        return True
 
     @database_sync_to_async
     def set_online_state(self, user, is_online):
@@ -212,5 +256,35 @@ class ChatConsumer(AsyncWebsocketConsumer):
         from chat.models import Room, ReadState
         room = Room.objects.get(name=room_name)
         read_state, _ = ReadState.objects.get_or_create(user=user, room=room)
-        read_state.save()  # last_read_at has auto_now=True, so saving bumps it
+        read_state.save()
         return read_state.last_read_at
+
+
+class NotificationConsumer(AsyncWebsocketConsumer):
+    """
+    A separate, always-on connection per logged-in user (not per-room).
+    Unlike ChatConsumer, which a client only connects to for whichever
+    room is currently open, this one stays connected for as long as the
+    app is open, so the sidebar (unread badges, new DMs, message requests)
+    can update live regardless of what's currently on screen.
+    """
+
+    async def connect(self):
+        self.user = self.scope["user"]
+        if not self.user or not self.user.is_authenticated:
+            await self.close(code=4001)
+            return
+
+        self.group_name = f"notify_user_{self.user.id}"
+        await self.channel_layer.group_add(self.group_name, self.channel_name)
+        await self.accept()
+
+    async def disconnect(self, close_code):
+        if hasattr(self, "group_name"):
+            await self.channel_layer.group_discard(self.group_name, self.channel_name)
+
+    async def conversation_update(self, event):
+        # Deliberately minimal payload — the frontend just re-fetches its
+        # room/DM lists on receiving this, rather than duplicating
+        # serialization logic here.
+        await self.send(text_data=json.dumps({"event": "update"}))

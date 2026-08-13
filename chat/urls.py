@@ -6,7 +6,10 @@ from .views import (
     UserListView,
     UserProfileView,
     DMListView,
+    DMRequestListView,
     StartDMView,
+    AcceptDMRequestView,
+    DeclineDMRequestView,
     MarkRoomReadView,
 )
 
@@ -16,6 +19,9 @@ urlpatterns = [
     path("rooms/<int:room_id>/read/", MarkRoomReadView.as_view(), name="room-read"),
     path("users/", UserListView.as_view(), name="user-list"),
     path("users/<int:user_id>/profile/", UserProfileView.as_view(), name="user-profile"),
-    path("dms/", DMListView.as_view(), name="dm-list"),          # GET
-    path("dms/start/", StartDMView.as_view(), name="dm-start"),  # POST
+    path("dms/", DMListView.as_view(), name="dm-list"),
+    path("dms/requests/", DMRequestListView.as_view(), name="dm-requests"),
+    path("dms/start/", StartDMView.as_view(), name="dm-start"),
+    path("dms/<int:room_id>/accept/", AcceptDMRequestView.as_view(), name="dm-accept"),
+    path("dms/<int:room_id>/decline/", DeclineDMRequestView.as_view(), name="dm-decline"),
 ]

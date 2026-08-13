@@ -1,3 +1,5 @@
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
 from django.contrib.auth import get_user_model
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
@@ -13,6 +15,17 @@ from .serializers import RoomSerializer, MessageSerializer, UserSerializer, Prof
 User = get_user_model()
 
 
+def notify_user(user_id):
+    """Pings a user's always-on notification socket (see
+    NotificationConsumer) so their sidebar refetches — used for anything
+    that happens outside their own WebSocket action, e.g. someone else
+    starting a DM with them, or a request being accepted/declined."""
+    channel_layer = get_channel_layer()
+    if channel_layer is None:
+        return
+    async_to_sync(channel_layer.group_send)(f"notify_user_{user_id}", {"type": "conversation_update"})
+
+
 class RoomListView(generics.ListAPIView):
     """Public/group rooms only — DMs are surfaced separately via /api/dms/."""
     queryset = Room.objects.filter(is_private=False)
@@ -22,8 +35,8 @@ class RoomListView(generics.ListAPIView):
 
 class UserListView(generics.ListAPIView):
     """GET /api/users/ — other users you can start a DM with.
-    Supports ?search=<query> for username filtering (used by the
-    "new message" picker's search box)."""
+    Supports ?search=<query> — an exact (case-insensitive) username match,
+    optionally prefixed with "@" (stripped before matching)."""
     serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -31,7 +44,8 @@ class UserListView(generics.ListAPIView):
         qs = User.objects.exclude(id=self.request.user.id)
         search = self.request.query_params.get("search")
         if search:
-            qs = qs.filter(username__icontains=search)
+            search = search.lstrip("@").strip()
+            qs = qs.filter(username__iexact=search) if search else qs.none()
         return qs.order_by("username")
 
 
@@ -44,21 +58,37 @@ class UserProfileView(generics.RetrieveAPIView):
 
 
 class DMListView(generics.ListAPIView):
-    """GET /api/dms/ — your existing 1:1 conversations."""
+    """GET /api/dms/ — your normal conversations: accepted DMs, plus any
+    pending request YOU sent (you see your own outgoing request normally;
+    it's the recipient who sees it separately as a request to respond to
+    — see DMRequestListView)."""
     serializer_class = RoomSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return Room.objects.filter(is_private=True, participants=self.request.user)
+        return Room.objects.filter(is_private=True, participants=self.request.user).filter(
+            Q(accepted=True) | Q(initiated_by=self.request.user)
+        )
+
+
+class DMRequestListView(generics.ListAPIView):
+    """GET /api/dms/requests/ — pending DMs someone else started with you,
+    that you haven't accepted yet."""
+    serializer_class = RoomSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Room.objects.filter(
+            is_private=True, accepted=False, participants=self.request.user
+        ).exclude(initiated_by=self.request.user)
 
 
 class StartDMView(APIView):
     """
-    POST /api/dms/ {"username": "bob"} — finds the existing DM room between
-    the current user and the named user, or creates one. Room names for DMs
-    are derived deterministically from both user IDs (sorted, so it's the
-    same regardless of who starts the conversation) rather than exposed as
-    something guessable from usernames alone.
+    POST /api/dms/start/ {"username": "bob"} — finds the existing DM room
+    between the current user and the named user, or creates one. A new DM
+    starts as a pending request (accepted=False) from the recipient's
+    side; the initiator can use it normally right away.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -76,10 +106,11 @@ class StartDMView(APIView):
 
         room, created = Room.objects.get_or_create(
             name=room_name,
-            defaults={"is_private": True},
+            defaults={"is_private": True, "initiated_by": request.user, "accepted": False},
         )
         if created:
             room.participants.set([request.user, other_user])
+            notify_user(other_user.id)  # so it shows up in their requests without a refresh
 
         return Response(
             RoomSerializer(room, context={"request": request}).data,
@@ -87,10 +118,46 @@ class StartDMView(APIView):
         )
 
 
+class AcceptDMRequestView(APIView):
+    """POST /api/dms/<room_id>/accept/ — accepts a pending message request."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, room_id):
+        room = get_object_or_404(Room, id=room_id, is_private=True)
+        if not room.participants.filter(id=request.user.id).exists():
+            return Response({"detail": "Not a participant"}, status=status.HTTP_403_FORBIDDEN)
+        if room.initiated_by_id == request.user.id:
+            return Response({"detail": "Can't accept your own request"}, status=status.HTTP_400_BAD_REQUEST)
+
+        room.accepted = True
+        room.save(update_fields=["accepted"])
+        if room.initiated_by_id:
+            notify_user(room.initiated_by_id)
+
+        return Response(RoomSerializer(room, context={"request": request}).data)
+
+
+class DeclineDMRequestView(APIView):
+    """POST /api/dms/<room_id>/decline/ — declines and deletes a pending
+    message request (and its messages, via cascade)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, room_id):
+        room = get_object_or_404(Room, id=room_id, is_private=True)
+        if not room.participants.filter(id=request.user.id).exists():
+            return Response({"detail": "Not a participant"}, status=status.HTTP_403_FORBIDDEN)
+        if room.initiated_by_id == request.user.id:
+            return Response({"detail": "Can't decline your own request"}, status=status.HTTP_400_BAD_REQUEST)
+
+        initiator_id = room.initiated_by_id
+        room.delete()
+        if initiator_id:
+            notify_user(initiator_id)
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class MessagePagination(CursorPagination):
-    # Cursor pagination (vs. offset/limit) so results stay stable even as
-    # new messages are added while someone scrolls up through history —
-    # doing this now avoids the Phase 4 rework flagged earlier.
     page_size = 30
     ordering = "-created_at"
 
@@ -105,8 +172,6 @@ class RoomMessageListView(generics.ListAPIView):
         room_id = self.kwargs["room_id"]
         room = get_object_or_404(Room, id=room_id)
 
-        # Private rooms: only participants may read history. Public rooms:
-        # anyone authenticated can (matches the open-room model from Phase 1).
         if room.is_private and not room.participants.filter(id=self.request.user.id).exists():
             return Message.objects.none()
 
@@ -121,5 +186,5 @@ class MarkRoomReadView(APIView):
     def post(self, request, room_id):
         room = get_object_or_404(Room, id=room_id)
         read_state, _ = ReadState.objects.get_or_create(user=request.user, room=room)
-        read_state.save()  # last_read_at has auto_now=True, so saving bumps it
+        read_state.save()
         return Response({"last_read_at": read_state.last_read_at})
