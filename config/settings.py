@@ -142,6 +142,21 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
+    # Global safety net — generous enough not to bother normal usage, but
+    # stops a runaway client (buggy frontend code, a script, whatever)
+    # from hammering the API unbounded. Auth endpoints get their own much
+    # stricter rates below, since brute-forcing a login is the case that
+    # actually matters most.
+    'DEFAULT_THROTTLE_CLASSES': (
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ),
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '60/min',
+        'user': '300/min',
+        'login': '5/min',
+        'register': '3/min',
+    },
 }
 
 SIMPLE_JWT = {

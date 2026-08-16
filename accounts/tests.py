@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -69,3 +70,46 @@ class MeViewTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["username"], "alice")
         self.assertIn("date_joined", response.data)
+
+
+class ThrottlingTests(APITestCase):
+    """DRF throttle state lives in the cache, which persists across tests
+    within the same run — clearing it before/after each test keeps these
+    isolated from each other and from unrelated tests hitting the same
+    endpoints."""
+
+    def setUp(self):
+        cache.clear()
+
+    def tearDown(self):
+        cache.clear()
+
+    def test_login_is_throttled_after_repeated_attempts(self):
+        User.objects.create_user(username="alice", password="testpass123")
+
+        # 'login' scope is set to 5/min in settings — the first 5 should
+        # go through (regardless of whether the credentials are right),
+        # the 6th should be blocked by the throttle itself.
+        for _ in range(5):
+            response = self.client.post(
+                "/api/auth/login/", {"username": "alice", "password": "wrongpassword"}
+            )
+            self.assertNotEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+        response = self.client.post(
+            "/api/auth/login/", {"username": "alice", "password": "wrongpassword"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    def test_register_is_throttled_after_repeated_attempts(self):
+        # 'register' scope is 3/min.
+        for i in range(3):
+            response = self.client.post(
+                "/api/auth/register/", {"username": f"user{i}", "password": "testpass123"}
+            )
+            self.assertNotEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+        response = self.client.post(
+            "/api/auth/register/", {"username": "user_over_limit", "password": "testpass123"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
