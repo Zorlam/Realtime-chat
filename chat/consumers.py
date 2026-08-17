@@ -81,6 +81,15 @@ class ChatConsumer(AsyncWebsocketConsumer):
     async def receive(self, text_data):
         data = json.loads(text_data)
 
+        if data.get("type") == "ping":
+            # Heartbeat — answered directly, not broadcast to the room.
+            # Lets the client detect a "zombie" connection (socket still
+            # reports OPEN, but nothing's actually getting through — can
+            # happen behind certain proxies/NAT timeouts) faster than
+            # waiting on a TCP-level timeout.
+            await self.send(text_data=json.dumps({"event": "pong"}))
+            return
+
         if data.get("type") == "typing":
             await self.channel_layer.group_send(
                 self.room_group_name,
@@ -282,6 +291,11 @@ class NotificationConsumer(AsyncWebsocketConsumer):
     async def disconnect(self, close_code):
         if hasattr(self, "group_name"):
             await self.channel_layer.group_discard(self.group_name, self.channel_name)
+
+    async def receive(self, text_data):
+        data = json.loads(text_data)
+        if data.get("type") == "ping":
+            await self.send(text_data=json.dumps({"event": "pong"}))
 
     async def conversation_update(self, event):
         # Deliberately minimal payload — the frontend just re-fetches its

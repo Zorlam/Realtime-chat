@@ -343,3 +343,42 @@ class ChatConsumerTests(TransactionTestCase):
         room = await Room.objects.acreate(name="dm-1-3", is_private=True)
         await room.participants.aadd(self.alice)
         return room
+
+    @patch("chat.presence.mark_connected", new_callable=AsyncMock, return_value=True)
+    @patch("chat.presence.mark_disconnected", new_callable=AsyncMock, return_value=True)
+    async def test_ping_gets_a_pong_reply(self, mock_disc, mock_conn):
+        token = make_token(self.alice)
+        communicator = ws_communicator(f"/ws/chat/Public/?token={token}")
+        await communicator.connect()
+        await communicator.receive_json_from()  # own user_joined
+        await communicator.receive_json_from()  # own presence
+
+        await communicator.send_json_to({"type": "ping"})
+        response = await communicator.receive_json_from()
+        self.assertEqual(response["event"], "pong")
+
+        await communicator.disconnect()
+
+
+@override_settings(CHANNEL_LAYERS={"default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}})
+class NotificationConsumerTests(TransactionTestCase):
+    def setUp(self):
+        self.alice = User.objects.create_user(username="alice", password="testpass123")
+
+    async def test_unauthenticated_connection_is_rejected(self):
+        communicator = WebsocketCommunicator(application, "/ws/notifications/")
+        connected, _ = await communicator.connect()
+        self.assertFalse(connected)
+        await communicator.disconnect()
+
+    async def test_authenticated_connect_and_ping_pong(self):
+        token = make_token(self.alice)
+        communicator = ws_communicator(f"/ws/notifications/?token={token}")
+        connected, _ = await communicator.connect()
+        self.assertTrue(connected)
+
+        await communicator.send_json_to({"type": "ping"})
+        response = await communicator.receive_json_from()
+        self.assertEqual(response["event"], "pong")
+
+        await communicator.disconnect()
