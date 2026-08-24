@@ -92,6 +92,9 @@ if os.environ.get("DATABASE_NAME"):
             'PASSWORD': os.environ.get("DATABASE_PASSWORD", ""),
             'HOST': os.environ.get("DATABASE_HOST", "localhost"),
             'PORT': os.environ.get("DATABASE_PORT", "5432"),
+            'OPTIONS': {
+                'sslmode': 'require',
+            },
         }
     }
 else:
@@ -121,13 +124,10 @@ CHANNEL_LAYERS = {
         "BACKEND": "channels_redis.core.RedisChannelLayer",
         "CONFIG": {
             "hosts": [
-                {
-                    "host": os.environ.get("REDIS_HOST", "127.0.0.1"),
-                    "port": int(os.environ.get("REDIS_PORT", 6379)),
-                    "socket_timeout": 30,
-                    "socket_connect_timeout": 30,
-                    "retry_on_timeout": True,
-                }
+                os.environ.get(
+                    "REDIS_URL",
+                    "redis://127.0.0.1:6379"
+                )
             ],
         },
     },
