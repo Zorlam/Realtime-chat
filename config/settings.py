@@ -80,7 +80,7 @@ WSGI_APPLICATION = 'config.wsgi.application'
 ASGI_APPLICATION = 'config.asgi.application'
 
 
-# Database
+# Database SQL lite
 # Defaults to SQLite for zero-setup local dev. Set DATABASE_* env vars to
 # point at PostgreSQL (matches the original project plan) once you're ready.
 if os.environ.get("DATABASE_NAME"):
