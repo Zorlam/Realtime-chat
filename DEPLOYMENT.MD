@@ -42,7 +42,7 @@ messages still deliver correctly across them, exactly like the earlier
 manual test where a message sent through one process was received by a
 client connected to the other.
 
-## Why Postgres here, and SQLite everywhere else
+## Why i made use of Postgres here, and SQLite everywhere else
 
 SQLite is a single file — fine for one process, but not safe for
 multiple backend replicas writing concurrently. This compose file uses
