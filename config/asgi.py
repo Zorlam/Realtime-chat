@@ -25,9 +25,7 @@ from chat.routing import websocket_urlpatterns  # noqa: E402
 
 application = ProtocolTypeRouter({
     "http": django_asgi_app,
-    "websocket": AllowedHostsOriginValidator(
-        JWTAuthMiddlewareStack(
-            URLRouter(websocket_urlpatterns)
-        )
-    ),
+    "websocket": JWTAuthMiddlewareStack(
+    URLRouter(websocket_urlpatterns)
+),
 })
