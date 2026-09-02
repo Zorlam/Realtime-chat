@@ -80,6 +80,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
     async def receive(self, text_data):
         data = json.loads(text_data)
+        print("WEBSOCKET RECEIVED:", data, flush=True)
 
         if data.get("type") == "ping":
             # Heartbeat — answered directly, not broadcast to the room.
